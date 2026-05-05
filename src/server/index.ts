@@ -2,8 +2,8 @@
  * NepalgGig Backend — HTTP Server
  *
  * Auth Routes (Phone Magic Link — No SMS Phase 1):
- *  POST /auth/request  { phone }              → { loginUrl, expiresAt, isNewUser }
- *  POST /auth/verify   { token, phone }       → { sessionToken, role, isNewUser }
+ *  POST /auth/request  { phone, deviceHash? }              → { loginUrl, expiresAt, isNewUser }
+ *  POST /auth/verify   { token, phone, deviceHash? }       → { sessionToken, role, isNewUser }
  *  POST /auth/logout   { sessionToken }       → { success }
  *  GET  /auth/session  (Authorization header) → { userId, role, phone }
  *
@@ -62,17 +62,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── POST /auth/request ─────────────────────────────────
-    // Body: { phone: string }
+    // Body: { phone: string, deviceHash?: string }
     // Returns: { success, loginUrl, expiresAt, isNewUser, phone }
     if (url === '/auth/request' && req.method === 'POST') {
-      const body = await readJSON<{ phone?: string }>(req);
+      const body = await readJSON<{ phone?: string; deviceHash?: string }>(req);
       if (!body.phone?.trim()) return send(res, 400, { error: 'phone is required' });
 
       const result = await requestAuthToken({
-        phone:     body.phone,
-        ipAddress: ip,
-        userAgent: req.headers['user-agent'],
-        baseUrl:   process.env.APP_BASE_URL,
+        phone:      body.phone,
+        deviceHash: body.deviceHash,
+        ipAddress:  ip,
+        userAgent:  req.headers['user-agent'],
+        baseUrl:    process.env.APP_BASE_URL,
       });
 
       if (!result.success) {
@@ -92,19 +93,20 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── POST /auth/verify ──────────────────────────────────
-    // Body: { token: string, phone: string }
+    // Body: { token: string, phone: string, deviceHash?: string }
     // Returns: { success, sessionToken, role, isNewUser }
     if (url === '/auth/verify' && req.method === 'POST') {
-      const body = await readJSON<{ token?: string; phone?: string }>(req);
+      const body = await readJSON<{ token?: string; phone?: string; deviceHash?: string }>(req);
       if (!body.token || !body.phone) {
         return send(res, 400, { error: 'token and phone are required' });
       }
 
       const result = await verifyAuthToken({
-        rawToken:  body.token,
-        phone:     body.phone,
-        ipAddress: ip,
-        userAgent: req.headers['user-agent'],
+        rawToken:   body.token,
+        phone:      body.phone,
+        deviceHash: body.deviceHash,
+        ipAddress:  ip,
+        userAgent:  req.headers['user-agent'],
       });
 
       if (!result.success) {
@@ -115,6 +117,8 @@ const server = http.createServer(async (req, res) => {
           too_many_attempts: 429,
           banned:            403,
           phone_mismatch:    401,
+          // device_conflict is a permanent ban — 403 Forbidden
+          device_conflict:   403,
         } as const;
         return send(res, statusMap[result.error] ?? 401, {
           success: false,

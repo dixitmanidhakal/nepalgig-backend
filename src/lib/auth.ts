@@ -2,7 +2,7 @@
  * NepalgGig — Phone Magic Link Auth (Phase 1, No SMS)
  *
  * Flow:
- *  1. POST /auth/request { phone }
+ *  1. POST /auth/request { phone, deviceHash? }
  *     → normalise phone → rate-limit check → upsert user
  *     → generate 48-byte token → store SHA-256 hash (15 min TTL)
  *     → return { loginUrl, token, expiresAt }
@@ -10,17 +10,22 @@
  *  2. User copies loginUrl, opens in browser (no SMS needed)
  *     /auth/verify?token=xxx&phone=xxx
  *
- *  3. POST /auth/verify { token, phone }
+ *  3. POST /auth/verify { token, phone, deviceHash? }
  *     → look up hash → validate (used/expired/attempts)
- *     → mark used → create 30-day session → return { sessionToken, role }
+ *     → device fingerprint check:
+ *         first login  → store deviceHash on user
+ *         hash matches → update lastSeenAt, refresh cookie
+ *         hash differs → PERMANENT BAN, return 'device_conflict'
+ *     → mark token used → create 30-day session → return { sessionToken, role }
  *
- *  4. Frontend sets sessionToken as httpOnly cookie → redirect by role
+ *  4. Frontend sets ng_session (httpOnly) + ng_device cookies → redirect by role
  *
  * Security:
  *  - Raw tokens NEVER stored — only SHA-256 hash
  *  - 15-min TTL, single-use, max 5 verify attempts
  *  - Rate-limited: 3 tokens per phone per hour
  *  - Auto-create user on first login (role='pending')
+ *  - Device fingerprint: mismatch → PERMANENT BAN (no recovery without admin)
  */
 
 import crypto from 'crypto';
@@ -63,6 +68,13 @@ export function isValidNepalPhone(phone: string): boolean {
   return /^\+977(98|97)\d{8}$/.test(phone);
 }
 
+// ── Device fingerprint helper ─────────────────────────────
+
+/** Validate that a device hash string looks like a SHA-256 hex */
+function isValidHash(h: string | undefined | null): h is string {
+  return typeof h === 'string' && /^[0-9a-f]{64}$/.test(h);
+}
+
 // ── Types ─────────────────────────────────────────────────
 
 export type RequestTokenResult =
@@ -71,15 +83,16 @@ export type RequestTokenResult =
 
 export type VerifyTokenResult =
   | { success: true;  sessionToken: string; userId: string; phone: string; role: string; isNewUser: boolean }
-  | { success: false; error: 'invalid' | 'expired' | 'used' | 'too_many_attempts' | 'banned' | 'phone_mismatch' };
+  | { success: false; error: 'invalid' | 'expired' | 'used' | 'too_many_attempts' | 'banned' | 'phone_mismatch' | 'device_conflict' };
 
 // ── Step 1: Request token ─────────────────────────────────
 
 export async function requestAuthToken(params: {
-  phone: string;
-  ipAddress?: string;
-  userAgent?: string;
-  baseUrl?: string;
+  phone:       string;
+  deviceHash?: string;
+  ipAddress?:  string;
+  userAgent?:  string;
+  baseUrl?:    string;
 }): Promise<RequestTokenResult> {
   const phone = normalizePhone(params.phone);
 
@@ -112,7 +125,7 @@ export async function requestAuthToken(params: {
     return { success: false, error: 'banned' };
   }
 
-  // Invalidate old tokens for this phone
+  // Invalidate old unused tokens for this phone
   await db
     .update(magicTokens)
     .set({ used: true, usedAt: new Date() })
@@ -124,15 +137,16 @@ export async function requestAuthToken(params: {
   const expiresAt = new Date(Date.now() + TOKEN_TTL_MS);
 
   await db.insert(magicTokens).values({
-    userId:    user.id,
+    userId:     user.id,
     phone,
     tokenHash,
-    tokenType: 'magic_link',
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    tokenType:  'magic_link',
+    ipAddress:  params.ipAddress,
+    userAgent:  params.userAgent,
+    deviceHash: isValidHash(params.deviceHash) ? params.deviceHash : undefined,
     expiresAt,
-    used:      false,
-    attempts:  0,
+    used:       false,
+    attempts:   0,
   });
 
   const base     = params.baseUrl ?? process.env.APP_BASE_URL ?? 'http://localhost:3000';
@@ -146,10 +160,11 @@ export async function requestAuthToken(params: {
 // ── Step 2: Verify token → session ───────────────────────
 
 export async function verifyAuthToken(params: {
-  rawToken: string;
-  phone: string;
-  ipAddress?: string;
-  userAgent?: string;
+  rawToken:    string;
+  phone:       string;
+  deviceHash?: string;
+  ipAddress?:  string;
+  userAgent?:  string;
 }): Promise<VerifyTokenResult> {
   const phone     = normalizePhone(params.phone);
   const tokenHash = hashToken(params.rawToken);
@@ -158,7 +173,7 @@ export async function verifyAuthToken(params: {
     where: eq(magicTokens.tokenHash, tokenHash),
   });
 
-  if (!token)                      return { success: false, error: 'invalid' };
+  if (!token)                       return { success: false, error: 'invalid' };
   if (token.phone !== phone)        return { success: false, error: 'phone_mismatch' };
   if (token.used)                   return { success: false, error: 'used' };
   if (token.expiresAt < new Date()) {
@@ -176,14 +191,53 @@ export async function verifyAuthToken(params: {
   if (!user)       return { success: false, error: 'invalid' };
   if (user.banned) return { success: false, error: 'banned' };
 
+  // ── Device fingerprint check ──────────────────────────────────────────────
+  // Incoming hash from the verify page's client-side getDeviceHash()
+  const incomingHash = isValidHash(params.deviceHash) ? params.deviceHash : null;
+
+  if (incomingHash) {
+    if (user.deviceHash && user.deviceHash !== incomingHash) {
+      // ─ CONFLICT: stored hash ≠ incoming hash
+      // This means the token is being redeemed from a DIFFERENT device than
+      // the one that originally registered/last logged in.
+      // → PERMANENT BAN — no SMS recovery, admin must lift it manually.
+      console.warn(
+        `[Auth] DEVICE CONFLICT for user ${user.id} (${phone}) — ` +
+        `stored: ${user.deviceHash.slice(0, 8)}… incoming: ${incomingHash.slice(0, 8)}… — BANNING`
+      );
+
+      await db.update(users)
+        .set({
+          banned:      true,
+          banReason:   'device_fingerprint_conflict',
+          updatedAt:   new Date(),
+        })
+        .where(eq(users.id, user.id));
+
+      // Invalidate all active sessions for this user
+      await db.update(sessions)
+        .set({ revoked: true, revokedAt: new Date(), revokeReason: 'device_conflict_ban' })
+        .where(and(eq(sessions.userId, user.id), eq(sessions.revoked, false)));
+
+      return { success: false, error: 'device_conflict' };
+    }
+  }
+  // ── End device check ──────────────────────────────────────────────────────
+
   // Mark token used
   await db.update(magicTokens)
     .set({ used: true, usedAt: new Date() })
     .where(eq(magicTokens.tokenHash, tokenHash));
 
-  // Update user
+  // Update user — set/refresh deviceHash on every successful login
+  const deviceHashUpdate = incomingHash ? { deviceHash: incomingHash } : {};
   await db.update(users)
-    .set({ lastSeenAt: new Date(), phoneVerifiedAt: user.phoneVerifiedAt ?? new Date() })
+    .set({
+      lastSeenAt:      new Date(),
+      phoneVerifiedAt: user.phoneVerifiedAt ?? new Date(),
+      updatedAt:       new Date(),
+      ...deviceHashUpdate,
+    })
     .where(eq(users.id, user.id));
 
   // Create 30-day session
@@ -196,6 +250,7 @@ export async function verifyAuthToken(params: {
     sessionToken: sessionHash,
     ipAddress:    params.ipAddress,
     userAgent:    params.userAgent,
+    deviceHash:   incomingHash ?? undefined,
     expiresAt:    sessionExpiry,
     revoked:      false,
   });
