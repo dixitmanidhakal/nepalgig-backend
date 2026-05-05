@@ -268,7 +268,7 @@ export async function verifyAuthToken(params: {
 // ── Session validation ────────────────────────────────────
 
 export async function validateSession(rawToken: string): Promise<{
-  userId: string; role: string; phone: string;
+  userId: string; role: string; phone: string; sessionId: string;
 } | null> {
   const tokenHash = hashToken(rawToken);
 
@@ -289,7 +289,7 @@ export async function validateSession(rawToken: string): Promise<{
   });
   if (!user) return null;
 
-  return { userId: user.id, role: user.role, phone: user.phone! };
+  return { userId: user.id, role: user.role, phone: user.phone!, sessionId: session.id };
 }
 
 /** Logout — revoke session */
