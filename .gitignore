@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.production
+.env.*.local
+.DS_Store
+Thumbs.db
+*.log
+logs/
+uploads/
+.pm2/
+.vscode/settings.json
+.idea/
+db/migrations/*.sql
